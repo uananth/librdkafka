@@ -1,7 +1,8 @@
 /*
  * librdkafka - Apache Kafka C library
  *
- * Copyright (c) 2019 Magnus Edenhill
+ * Copyright (c) 2019-2022, Magnus Edenhill
+ *               2023, Confluent Inc.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -37,10 +38,14 @@
 #include "rdkafka_interceptor.h"
 #include "rdkafka_mock_int.h"
 #include "rdkafka_transport_int.h"
-
+#include "rdkafka_mock.h"
 #include <stdarg.h>
 
+typedef struct rd_kafka_mock_request_s rd_kafka_mock_request_t;
+
 static void rd_kafka_mock_cluster_destroy0(rd_kafka_mock_cluster_t *mcluster);
+static rd_kafka_mock_request_t *
+rd_kafka_mock_request_new(int32_t id, int16_t api_key, int64_t timestamp_us);
 
 
 static rd_kafka_mock_broker_t *
@@ -93,6 +98,7 @@ rd_kafka_mock_msgset_new(rd_kafka_mock_partition_t *mpart,
         rd_kafka_mock_msgset_t *mset;
         size_t totsize = sizeof(*mset) + RD_KAFKAP_BYTES_LEN(bytes);
         int64_t BaseOffset;
+        int32_t PartitionLeaderEpoch;
         int64_t orig_start_offset = mpart->start_offset;
 
         rd_assert(!RD_KAFKAP_BYTES_IS_NULL(bytes));
@@ -107,7 +113,8 @@ rd_kafka_mock_msgset_new(rd_kafka_mock_partition_t *mpart,
                 mpart->follower_end_offset = mpart->end_offset;
         mpart->cnt++;
 
-        mset->bytes.len = bytes->len;
+        mset->bytes.len    = bytes->len;
+        mset->leader_epoch = mpart->leader_epoch;
 
 
         mset->bytes.data = (void *)(mset + 1);
@@ -118,7 +125,11 @@ rd_kafka_mock_msgset_new(rd_kafka_mock_partition_t *mpart,
          * actual absolute log offset. */
         BaseOffset = htobe64(mset->first_offset);
         memcpy((void *)mset->bytes.data, &BaseOffset, sizeof(BaseOffset));
-
+        /* Update the base PartitionLeaderEpoch in the MessageSet with the
+         * actual partition leader epoch. */
+        PartitionLeaderEpoch = htobe32(mset->leader_epoch);
+        memcpy(((char *)mset->bytes.data) + 12, &PartitionLeaderEpoch,
+               sizeof(PartitionLeaderEpoch));
 
         /* Remove old msgsets until within limits */
         while (mpart->cnt > 1 &&
@@ -365,6 +376,52 @@ static void
 rd_kafka_mock_partition_set_leader0(rd_kafka_mock_partition_t *mpart,
                                     rd_kafka_mock_broker_t *mrkb) {
         mpart->leader = mrkb;
+        mpart->leader_epoch++;
+}
+
+
+/**
+ * @brief Verifies that the client-provided leader_epoch matches that of the
+ *        partition, else returns the appropriate error.
+ */
+rd_kafka_resp_err_t rd_kafka_mock_partition_leader_epoch_check(
+    const rd_kafka_mock_partition_t *mpart,
+    int32_t leader_epoch) {
+        if (likely(leader_epoch == -1 || mpart->leader_epoch == leader_epoch))
+                return RD_KAFKA_RESP_ERR_NO_ERROR;
+        else if (mpart->leader_epoch < leader_epoch)
+                return RD_KAFKA_RESP_ERR_UNKNOWN_LEADER_EPOCH;
+        else if (mpart->leader_epoch > leader_epoch)
+                return RD_KAFKA_RESP_ERR_FENCED_LEADER_EPOCH;
+
+        /* NOTREACHED, but avoids warning */
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+/**
+ * @brief Returns the end offset (last offset + 1)
+ *        for the passed leader epoch in the mock partition.
+ *
+ * @param mpart The mock partition
+ * @param leader_epoch The leader epoch
+ *
+ * @return The end offset for the passed \p leader_epoch in \p mpart
+ */
+int64_t rd_kafka_mock_partition_offset_for_leader_epoch(
+    const rd_kafka_mock_partition_t *mpart,
+    int32_t leader_epoch) {
+        const rd_kafka_mock_msgset_t *mset = NULL;
+
+        if (leader_epoch < 0)
+                return -1;
+
+        TAILQ_FOREACH_REVERSE(mset, &mpart->msgsets,
+                              rd_kafka_mock_msgset_tailq_s, link) {
+                if (mset->leader_epoch == leader_epoch)
+                        return mset->last_offset + 1;
+        }
+
+        return -1;
 }
 
 
@@ -372,12 +429,15 @@ rd_kafka_mock_partition_set_leader0(rd_kafka_mock_partition_t *mpart,
  * @brief Automatically assign replicas for partition
  */
 static void
-rd_kafka_mock_partition_assign_replicas(rd_kafka_mock_partition_t *mpart) {
+rd_kafka_mock_partition_assign_replicas(rd_kafka_mock_partition_t *mpart,
+                                        int replication_factor) {
         rd_kafka_mock_cluster_t *mcluster = mpart->topic->cluster;
-        int replica_cnt =
-            RD_MIN(mcluster->defaults.replication_factor, mcluster->broker_cnt);
+        int replica_cnt = RD_MIN(replication_factor, mcluster->broker_cnt);
         rd_kafka_mock_broker_t *mrkb;
         int i = 0;
+        int first_replica =
+            (mpart->id * replication_factor) % mcluster->broker_cnt;
+        int skipped = 0;
 
         if (mpart->replicas)
                 rd_free(mpart->replicas);
@@ -385,7 +445,19 @@ rd_kafka_mock_partition_assign_replicas(rd_kafka_mock_partition_t *mpart) {
         mpart->replicas    = rd_calloc(replica_cnt, sizeof(*mpart->replicas));
         mpart->replica_cnt = replica_cnt;
 
-        /* FIXME: randomize this using perhaps reservoir sampling */
+
+        /* Use a predictable, determininistic order on a per-topic basis.
+         *
+         * Two loops are needed for wraparound. */
+        TAILQ_FOREACH(mrkb, &mcluster->brokers, link) {
+                if (skipped < first_replica) {
+                        skipped++;
+                        continue;
+                }
+                if (i == mpart->replica_cnt)
+                        break;
+                mpart->replicas[i++] = mrkb;
+        }
         TAILQ_FOREACH(mrkb, &mcluster->brokers, link) {
                 if (i == mpart->replica_cnt)
                         break;
@@ -494,7 +566,9 @@ static void rd_kafka_mock_partition_init(rd_kafka_mock_topic_t *mtopic,
         mpart->topic = mtopic;
         mpart->id    = id;
 
-        mpart->follower_id = -1;
+        mpart->follower_id  = -1;
+        mpart->leader_epoch = -1; /* Start at -1 since assign_replicas() will
+                                   * bump it right away to 0. */
 
         TAILQ_INIT(&mpart->msgsets);
 
@@ -508,13 +582,13 @@ static void rd_kafka_mock_partition_init(rd_kafka_mock_topic_t *mtopic,
 
         rd_list_init(&mpart->pidstates, 0, rd_free);
 
-        rd_kafka_mock_partition_assign_replicas(mpart);
+        rd_kafka_mock_partition_assign_replicas(mpart, replication_factor);
 }
 
 rd_kafka_mock_partition_t *
 rd_kafka_mock_partition_find(const rd_kafka_mock_topic_t *mtopic,
                              int32_t partition) {
-        if (partition < 0 || partition >= mtopic->partition_cnt)
+        if (!mtopic || partition < 0 || partition >= mtopic->partition_cnt)
                 return NULL;
 
         return (rd_kafka_mock_partition_t *)&mtopic->partitions[partition];
@@ -1057,6 +1131,15 @@ rd_kafka_mock_connection_parse_request(rd_kafka_mock_connection_t *mconn,
                 return -1;
         }
 
+        mtx_lock(&mcluster->lock);
+        if (mcluster->track_requests) {
+                rd_list_add(&mcluster->request_list,
+                            rd_kafka_mock_request_new(
+                                mconn->broker->id, rkbuf->rkbuf_reqhdr.ApiKey,
+                                rd_clock()));
+        }
+        mtx_unlock(&mcluster->lock);
+
         rd_kafka_dbg(rk, MOCK, "MOCK",
                      "Broker %" PRId32 ": Received %sRequestV%hd from %s",
                      mconn->broker->id,
@@ -1415,6 +1498,9 @@ static void rd_kafka_mock_broker_destroy(rd_kafka_mock_broker_t *mrkb) {
                 TAILQ_REMOVE(&mrkb->errstacks, errstack, link);
                 rd_kafka_mock_error_stack_destroy(errstack);
         }
+
+        if (mrkb->rack)
+                rd_free(mrkb->rack);
 
         TAILQ_REMOVE(&mrkb->cluster->brokers, mrkb, link);
         mrkb->cluster->broker_cnt--;
@@ -2452,6 +2538,7 @@ rd_kafka_mock_cluster_t *rd_kafka_mock_cluster_new(rd_kafka_t *rk,
         TAILQ_INIT(&mcluster->topics);
         mcluster->defaults.partition_cnt      = 4;
         mcluster->defaults.replication_factor = RD_MIN(3, broker_cnt);
+        mcluster->track_requests              = rd_false;
 
         TAILQ_INIT(&mcluster->cgrps);
 
@@ -2528,4 +2615,96 @@ rd_kafka_mock_cluster_t *rd_kafka_handle_mock_cluster(const rd_kafka_t *rk) {
 const char *
 rd_kafka_mock_cluster_bootstraps(const rd_kafka_mock_cluster_t *mcluster) {
         return mcluster->bootstraps;
+}
+
+/**
+ * @struct Represents a request to the mock cluster along with a timestamp.
+ */
+struct rd_kafka_mock_request_s {
+        int32_t id;      /**< Broker id */
+        int16_t api_key; /**< API Key of request */
+        rd_ts_t timestamp /**< Timestamp at which request was received */;
+};
+
+/**
+ * @brief Allocate and initialize a rd_kafka_mock_request_t *
+ */
+static rd_kafka_mock_request_t *
+rd_kafka_mock_request_new(int32_t id, int16_t api_key, int64_t timestamp_us) {
+        rd_kafka_mock_request_t *request;
+        request            = rd_malloc(sizeof(*request));
+        request->id        = id;
+        request->api_key   = api_key;
+        request->timestamp = timestamp_us;
+        return request;
+}
+
+static rd_kafka_mock_request_t *
+rd_kafka_mock_request_copy(rd_kafka_mock_request_t *mrequest) {
+        rd_kafka_mock_request_t *request;
+        request            = rd_malloc(sizeof(*request));
+        request->id        = mrequest->id;
+        request->api_key   = mrequest->api_key;
+        request->timestamp = mrequest->timestamp;
+        return request;
+}
+
+void rd_kafka_mock_request_destroy(rd_kafka_mock_request_t *element) {
+        rd_free(element);
+}
+
+static void rd_kafka_mock_request_free(void *element) {
+        rd_kafka_mock_request_destroy(element);
+}
+
+void rd_kafka_mock_start_request_tracking(rd_kafka_mock_cluster_t *mcluster) {
+        mtx_lock(&mcluster->lock);
+        mcluster->track_requests = rd_true;
+        rd_list_init(&mcluster->request_list, 32, rd_kafka_mock_request_free);
+        mtx_unlock(&mcluster->lock);
+}
+
+void rd_kafka_mock_stop_request_tracking(rd_kafka_mock_cluster_t *mcluster) {
+        mtx_lock(&mcluster->lock);
+        mcluster->track_requests = rd_false;
+        rd_list_clear(&mcluster->request_list);
+        mtx_unlock(&mcluster->lock);
+}
+
+rd_kafka_mock_request_t **
+rd_kafka_mock_get_requests(rd_kafka_mock_cluster_t *mcluster, size_t *cntp) {
+        size_t i;
+        rd_kafka_mock_request_t **ret = NULL;
+
+        mtx_lock(&mcluster->lock);
+        *cntp = rd_list_cnt(&mcluster->request_list);
+        if (*cntp > 0) {
+                ret = rd_calloc(*cntp, sizeof(rd_kafka_mock_request_t *));
+                for (i = 0; i < *cntp; i++) {
+                        rd_kafka_mock_request_t *mreq =
+                            rd_list_elem(&mcluster->request_list, i);
+                        ret[i] = rd_kafka_mock_request_copy(mreq);
+                }
+        }
+
+        mtx_unlock(&mcluster->lock);
+        return ret;
+}
+
+void rd_kafka_mock_clear_requests(rd_kafka_mock_cluster_t *mcluster) {
+        mtx_lock(&mcluster->lock);
+        rd_list_clear(&mcluster->request_list);
+        mtx_unlock(&mcluster->lock);
+}
+
+int32_t rd_kafka_mock_request_id(rd_kafka_mock_request_t *mreq) {
+        return mreq->id;
+}
+
+int16_t rd_kafka_mock_request_api_key(rd_kafka_mock_request_t *mreq) {
+        return mreq->api_key;
+}
+
+rd_ts_t rd_kafka_mock_request_timestamp(rd_kafka_mock_request_t *mreq) {
+        return mreq->timestamp;
 }

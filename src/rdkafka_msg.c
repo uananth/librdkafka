@@ -1,7 +1,8 @@
 /*
  * librdkafka - Apache Kafka C library
  *
- * Copyright (c) 2012,2013 Magnus Edenhill
+ * Copyright (c) 2012-2022, Magnus Edenhill,
+ *               2023, Confluent Inc.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -1560,6 +1561,19 @@ rd_kafka_message_status(const rd_kafka_message_t *rkmessage) {
 }
 
 
+int32_t rd_kafka_message_leader_epoch(const rd_kafka_message_t *rkmessage) {
+        rd_kafka_msg_t *rkm;
+        if (unlikely(!rkmessage->rkt || rd_kafka_rkt_is_lw(rkmessage->rkt) ||
+                     !rkmessage->rkt->rkt_rk ||
+                     rkmessage->rkt->rkt_rk->rk_type != RD_KAFKA_CONSUMER))
+                return -1;
+
+        rkm = rd_kafka_message2msg((rd_kafka_message_t *)rkmessage);
+
+        return rkm->rkm_u.consumer.leader_epoch;
+}
+
+
 void rd_kafka_msgq_dump(FILE *fp, const char *what, rd_kafka_msgq_t *rkmq) {
         rd_kafka_msg_t *rkm;
         int cnt = 0;
@@ -2019,9 +2033,11 @@ static int unittest_msgq_order(const char *what,
         }
 
         /* Retry the messages, which moves them back to sendq
-         * maintaining the original order */
+         * maintaining the original order with exponential backoff
+         * set to false */
         rd_kafka_retry_msgq(&rkmq, &sendq, 1, 1, 0,
-                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp);
+                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp, rd_false, 0,
+                            0);
 
         RD_UT_ASSERT(rd_kafka_msgq_len(&sendq) == 0,
                      "sendq FIFO should be empty, not contain %d messages",
@@ -2059,9 +2075,11 @@ static int unittest_msgq_order(const char *what,
         }
 
         /* Retry the messages, which should now keep the 3 first messages
-         * on sendq (no more retries) and just number 4 moved back. */
+         * on sendq (no more retries) and just number 4 moved back.
+         * No exponential backoff applied. */
         rd_kafka_retry_msgq(&rkmq, &sendq, 1, 1, 0,
-                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp);
+                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp, rd_false, 0,
+                            0);
 
         if (fifo) {
                 if (ut_verify_msgq_order("readded #2", &rkmq, 4, 6, rd_true))
@@ -2080,9 +2098,10 @@ static int unittest_msgq_order(const char *what,
                         return 1;
         }
 
-        /* Move all messages back on rkmq */
+        /* Move all messages back on rkmq without any exponential backoff. */
         rd_kafka_retry_msgq(&rkmq, &sendq, 0, 1000, 0,
-                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp);
+                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp, rd_false, 0,
+                            0);
 
 
         /* Move first half of messages to sendq (1,2,3).
@@ -2102,11 +2121,14 @@ static int unittest_msgq_order(const char *what,
         rkm                       = ut_rd_kafka_msg_new(msgsize);
         rkm->rkm_u.producer.msgid = i;
         rd_kafka_msgq_enq_sorted0(&rkmq, rkm, cmp);
-
+        /* No exponential backoff applied. */
         rd_kafka_retry_msgq(&rkmq, &sendq, 0, 1000, 0,
-                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp);
+                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp, rd_false, 0,
+                            0);
+        /* No exponential backoff applied. */
         rd_kafka_retry_msgq(&rkmq, &sendq2, 0, 1000, 0,
-                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp);
+                            RD_KAFKA_MSG_STATUS_NOT_PERSISTED, cmp, rd_false, 0,
+                            0);
 
         RD_UT_ASSERT(rd_kafka_msgq_len(&sendq) == 0,
                      "sendq FIFO should be empty, not contain %d messages",
